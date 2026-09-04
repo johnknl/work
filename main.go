@@ -14,8 +14,8 @@ import (
 
 type config struct {
 	worktreeDir    string
-	forceRemove    bool
-	openTmuxWindow bool
+	worktreePrefix string
+	printPath      bool
 	forceCreate    bool
 }
 
@@ -28,16 +28,8 @@ func main() {
 	root := &cobra.Command{
 		Use:   "work [name]",
 		Short: "Open and manage git worktrees",
-		Long: strings.Join([]string{
-			"Open/switch named worktrees and manage related branches.",
-			"",
-			"Environment variables:",
-			"  WORKTREE_DIR     (default: $PWD/.work)",
-			"  FORCE_REMOVE     (1 to skip remove confirmation)",
-			"  OPEN_TMUX_WINDOW (0 to print path instead of opening tmux)",
-			"  FORCE_CREATE     (1 to skip create confirmation)",
-		}, "\n"),
-		Args: cobra.MaximumNArgs(1),
+		Long:  "Open/switch named worktrees. WORKTREE_DIR defaults to $PWD/.work.",
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return cmd.Help()
@@ -47,11 +39,14 @@ func main() {
 		ValidArgsFunction: worktreeNameCompletion,
 	}
 
+	root.Flags().BoolVarP(&cfg.forceCreate, "force", "f", false, "skip create confirmation")
+	root.Flags().BoolVarP(&cfg.printPath, "print", "p", false, "print path")
+
 	root.AddCommand(&cobra.Command{
 		Use:   "list",
 		Short: "List existing worktrees",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return listWorktrees()
+			return listWorktrees(cfg)
 		},
 	})
 
@@ -63,15 +58,21 @@ func main() {
 		},
 	})
 
-	root.AddCommand(&cobra.Command{
+	removeCmd := &cobra.Command{
 		Use:               "remove <name>",
 		Short:             "Remove named worktree and its branch",
 		Args:              cobra.ExactArgs(1),
 		ValidArgsFunction: worktreeNameCompletion,
-		RunE: func(_ *cobra.Command, args []string) error {
-			return removeWorktree(cfg, args[0])
+		RunE: func(cmd *cobra.Command, args []string) error {
+			forceRemove, err := cmd.Flags().GetBool("force")
+			if err != nil {
+				return err
+			}
+			return removeWorktree(cfg, args[0], forceRemove)
 		},
-	})
+	}
+	removeCmd.Flags().BoolP("force", "f", false, "skip confirmation")
+	root.AddCommand(removeCmd)
 
 	root.CompletionOptions.HiddenDefaultCmd = true
 	root.InitDefaultCompletionCmd()
@@ -85,6 +86,12 @@ func loadConfig() (config, error) {
 		return config{}, fmt.Errorf("get working directory: %w", err)
 	}
 
+	repoRoot := cwd
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err == nil {
+		repoRoot = strings.TrimSpace(string(out))
+	}
+
 	worktreeDir := os.Getenv("WORKTREE_DIR")
 	if worktreeDir == "" {
 		worktreeDir = filepath.Join(cwd, ".work")
@@ -92,14 +99,14 @@ func loadConfig() (config, error) {
 
 	return config{
 		worktreeDir:    worktreeDir,
-		forceRemove:    os.Getenv("FORCE_REMOVE") == "1",
-		openTmuxWindow: os.Getenv("OPEN_TMUX_WINDOW") != "0",
-		forceCreate:    os.Getenv("FORCE_CREATE") == "1",
+		worktreePrefix: filepath.Base(repoRoot) + "-",
+		printPath:      false,
+		forceCreate:    false,
 	}, nil
 }
 
-func listWorktrees() error {
-	names, err := worktreeNames()
+func listWorktrees(cfg config) error {
+	names, err := worktreeNames(cfg.worktreePrefix)
 	if err != nil {
 		return err
 	}
@@ -111,7 +118,7 @@ func listWorktrees() error {
 	return nil
 }
 
-func worktreeNames() ([]string, error) {
+func worktreeNames(prefix string) ([]string, error) {
 	out, err := exec.Command("git", "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return nil, fmt.Errorf("list worktrees: %w", err)
@@ -124,8 +131,8 @@ func worktreeNames() ([]string, error) {
 		}
 		path := strings.TrimPrefix(string(line), "worktree ")
 		base := filepath.Base(path)
-		if strings.HasPrefix(base, "alog-") {
-			names = append(names, strings.TrimPrefix(base, "alog-"))
+		if strings.HasPrefix(base, prefix) {
+			names = append(names, strings.TrimPrefix(base, prefix))
 		}
 	}
 
@@ -133,7 +140,12 @@ func worktreeNames() ([]string, error) {
 }
 
 func worktreeNameCompletion(_ *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	names, err := worktreeNames()
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	names, err := worktreeNames(cfg.worktreePrefix)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
@@ -148,11 +160,15 @@ func worktreeNameCompletion(_ *cobra.Command, _ []string, toComplete string) ([]
 	return completions, cobra.ShellCompDirectiveNoFileComp
 }
 
-func removeWorktree(cfg config, name string) error {
+func removeWorktree(cfg config, name string, forceRemove bool) error {
 	branch := "feat/" + name
-	targetPath := filepath.Join(cfg.worktreeDir, "alog-"+name)
+	targetPath := filepath.Join(cfg.worktreeDir, cfg.worktreePrefix+name)
 
-	if cfg.forceRemove {
+	if !exists(targetPath) {
+		return fmt.Errorf("worktree does not exist: %s", targetPath)
+	}
+
+	if forceRemove {
 		fmt.Printf("Force removing worktree and branch for '%s'\n", name)
 	} else {
 		ok, err := confirm(fmt.Sprintf("Are you sure you want to remove the worktree and branch for '%s'? [y/N] ", name))
@@ -173,7 +189,7 @@ func removeWorktree(cfg config, name string) error {
 
 func openOrCreateWorktree(cfg config, name string) error {
 	branch := "feat/" + name
-	targetPath := filepath.Join(cfg.worktreeDir, "alog-"+name)
+	targetPath := filepath.Join(cfg.worktreeDir, cfg.worktreePrefix+name)
 
 	if err := os.MkdirAll(cfg.worktreeDir, 0o755); err != nil {
 		return fmt.Errorf("create worktree root: %w", err)
@@ -201,7 +217,7 @@ func openOrCreateWorktree(cfg config, name string) error {
 		}
 	}
 
-	if !cfg.openTmuxWindow {
+	if cfg.printPath {
 		fmt.Println(targetPath)
 		return nil
 	}
